@@ -1,0 +1,33 @@
+#!/usr/bin/env php
+<?php
+
+use AgilePixel\AllsWell\Cli\Application;
+use Composer\InstalledVersions;
+
+$autoloaders = [];
+if (isset($GLOBALS['_composer_autoload_path']) && is_string($GLOBALS['_composer_autoload_path'])) {
+    $autoloaders[] = $GLOBALS['_composer_autoload_path'];
+}
+$autoloaders[] = __DIR__.'/../../../autoload.php';
+$autoloaders[] = __DIR__.'/../vendor/autoload.php';
+
+$loaded = false;
+foreach ($autoloaders as $autoloader) {
+    if (is_file($autoloader)) {
+        require $autoloader;
+        $loaded = true;
+        break;
+    }
+}
+
+if (! $loaded) {
+    fwrite(STDERR, "All's Well: Composer's autoloader was not found. Run `composer install`.\n");
+    exit(1);
+}
+
+$root = realpath(InstalledVersions::getRootPackage()['install_path']);
+if ($root === false) {
+    $root = getcwd();
+}
+
+exit((new Application)->run($argv, getenv(), $root === false ? '.' : $root));
