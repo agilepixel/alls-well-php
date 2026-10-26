@@ -2,6 +2,12 @@
 
 The notable changes in each release, newest first. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.0.1
+
+- `php artisan alls-well:install` with `ALLS_WELL_STORE=cache` no longer tries to create the `alls_well_state` table. With the team key on an app without a database, it stopped there; now it connects.
+- The `laravel.secure_cookies` check decides whether the site is served over https from its reported address (`ALLS_WELL_SITE_URL`, else `APP_URL`), so it also warns on an app whose `APP_URL` is `http://localhost`.
+- The README corrects what happens when an app on the team key moves domain, when the cache store is needed, and what to remove before `composer remove`. It adds which check results alert, what `disconnect` does in All's Well, and the site limit.
+
 ## 1.0.0
 
 The first release.

@@ -4,10 +4,13 @@ namespace AgilePixel\AllsWell\Laravel\Checks;
 
 use AgilePixel\AllsWell\Checks\Check;
 use AgilePixel\AllsWell\Checks\CheckResult;
+use AgilePixel\AllsWell\Laravel\LaravelConfig;
 use Illuminate\Contracts\Foundation\Application;
 
 /**
- * Session cookies should be marked secure on an https production app.
+ * Session cookies should be marked secure on a production app served over
+ * https, judged by the address the site reports as (ALLS_WELL_SITE_URL, else
+ * APP_URL).
  */
 final class SecureCookiesCheck implements Check
 {
@@ -35,7 +38,7 @@ final class SecureCookiesCheck implements Check
             return CheckResult::pass($label, 'low', true);
         }
 
-        $https = stripos((string) $this->app->make('config')->get('app.url'), 'https://') === 0;
+        $https = stripos((string) LaravelConfig::siteUrl($this->app), 'https://') === 0;
         if ($https && Environment::isProduction($this->app->environment())) {
             return CheckResult::warn($label, 'low', false);
         }

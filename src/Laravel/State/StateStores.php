@@ -24,8 +24,7 @@ final class StateStores
      */
     public static function make(Container $app, $keyMode)
     {
-        $setting = $app->make('config')->get('alls_well.store');
-        $setting = is_string($setting) ? strtolower(trim($setting)) : 'auto';
+        $setting = self::setting($app);
         $database = new DatabaseStateStore($app->make('db'));
 
         if ($setting === 'database') {
@@ -40,6 +39,19 @@ final class StateStores
         }
 
         return self::cache($app);
+    }
+
+    /**
+     * alls_well.store as "database", "cache", or "auto" for anything else.
+     *
+     * @return string
+     */
+    public static function setting(Container $app)
+    {
+        $setting = $app->make('config')->get('alls_well.store');
+        $setting = is_string($setting) ? strtolower(trim($setting)) : 'auto';
+
+        return in_array($setting, ['database', 'cache'], true) ? $setting : 'auto';
     }
 
     /**

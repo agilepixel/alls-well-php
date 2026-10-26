@@ -12,8 +12,8 @@ use AgilePixel\AllsWell\Support\Url;
 
 /**
  * Decides whether to enrol, report, pause or wait, sends the report and
- * records All's Well's answer. It never throws: whatever fails comes back as
- * a failed Result and one log line naming only the exception's class.
+ * records the answer from All's Well. It never throws: whatever fails comes
+ * back as a failed Result and one log line naming only the exception's class.
  *
  * A key-mode connection belongs to the address it was enrolled for. A copy of
  * the app (the same state file at another address) never reports with it: it
@@ -518,8 +518,8 @@ final class Reporter
     }
 
     /**
-     * Record All's Well's answer to a report, as the WordPress add-on's
-     * record() does. Every answer stamps the attempt and its status.
+     * Record the answer from All's Well to a report. Every answer stamps the
+     * attempt and its status.
      *
      * Only the owner can fix a 409 site_moved, a 410 or a 422, so those need
      * attention. Everything else is retried by itself, and needs attention
@@ -623,11 +623,11 @@ final class Reporter
     }
 
     /**
-     * Where to report from now on when All's Well has moved, as the WordPress
-     * add-on's follow_app_move() does. All's Well still answers at the address
-     * it moved from and names the new one. The move is followed only from a
-     * connection made at another address than the configured origin, and
-     * only to that origin, so an answer can never send the token elsewhere.
+     * Where to report from now on when All's Well has moved. All's Well still
+     * answers at the address it moved from and names the new one. The move is
+     * followed only from a connection made at another address than the
+     * configured origin, and only to that origin, so an answer can never send
+     * the token elsewhere.
      *
      * @param  array<mixed>  $body
      * @return array<string, string>
@@ -874,7 +874,7 @@ final class Reporter
      * Without a state file nothing is remembered between runs, so this is
      * never known, and treating every failure as the first would print on
      * every cron run, all through an All's Well outage. Those failures stay
-     * quiet instead: All's Well's own alerts cover a site that stops
+     * quiet instead: the alerts in All's Well cover a site that stops
      * reporting or never starts, and a run in a terminal still prints.
      *
      * @return bool

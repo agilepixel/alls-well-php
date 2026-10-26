@@ -2,7 +2,7 @@
 
 [All's Well](https://alls-well.io) monitors uptime, SSL certificates, cron jobs and servers, and alerts you when something goes wrong.
 
-This package connects a Laravel app, or any other PHP app, to All's Well as a **site**. Every hour the app reports its PHP, framework and database versions, every Composer package it runs, and checks on its configuration, queues and scheduler. All's Well alerts you when the app stops reporting, and on the Pro and Business plans it checks the packages for known vulnerabilities. See [pricing](https://alls-well.io/pricing) for what each plan includes.
+This package connects a Laravel app, or any other PHP app, to All's Well as a **site**. Every hour the app reports its PHP, framework and database versions, every Composer package it runs, and the results of its checks: in Laravel, its configuration, queues and scheduler; in any app, the checks you add. All's Well alerts you when the app stops reporting, and on the Pro and Business plans it checks the packages for known vulnerabilities. See [pricing](https://alls-well.io/pricing) for what each plan includes.
 
 - [Requirements](#requirements)
 - [Laravel quick start](#laravel-quick-start)
@@ -40,13 +40,17 @@ This package connects a Laravel app, or any other PHP app, to All's Well as a **
    ALLS_WELL_SITE_URL=https://shop.example.com
    ```
 
-   Many apps keep `APP_URL=http://localhost` in production, because their pages work regardless. The package won't report from a local or private address, so set `ALLS_WELL_SITE_URL` whenever `APP_URL` isn't the address people visit.
+   The address must be the one the site has in All's Well: a report from any other address is refused (see [Copied and moved apps](#copied-and-moved-apps)). The package won't report from a local or private address, so set `ALLS_WELL_SITE_URL` whenever `APP_URL` isn't the address people visit. Many apps keep `APP_URL=http://localhost` in production because their pages work regardless, but Laravel builds the links in queued mail and notifications from `APP_URL`, so the `laravel.https` check warns until it's the public https address.
 
-4. Run the installer. It publishes `config/alls_well.php`, creates the package's `alls_well_state` table, connects and sends the first report:
+   If the app's configuration is cached, as it usually is in production, run `php artisan config:cache` again after editing `.env`.
+
+4. Run the installer where the app is deployed. Local and testing environments never report, so it won't connect there. It publishes `config/alls_well.php`, creates the package's `alls_well_state` table, connects and sends the first report:
 
    ```sh
    php artisan alls-well:install
    ```
+
+   An app without a database, or one the scheduler can't reach, sets `ALLS_WELL_STORE=cache` first: see [Apps without a database](#apps-without-a-database).
 
 5. Reports go out every hour from Laravel's scheduler, so the scheduler must run. If it doesn't yet, add Laravel's cron line on the server:
 
@@ -73,16 +77,16 @@ ALLS_WELL_SITE_URL=https://shop.example.com
 php artisan alls-well:install
 ```
 
-Each app enrols as a site of its own, under its own address. It keeps the site token it gets in its database, in the `alls_well_state` table that `alls-well:install` creates (`php artisan migrate` creates it too). With the key, that table is required: without it the app has nowhere to keep its token, so it doesn't enrol, and `alls-well:status` says why.
+Each app enrols as a site of its own, under its own address. It keeps the site token it gets in its database, in the `alls_well_state` table that `alls-well:install` creates (`php artisan migrate` creates it too). With the key, the token has to be kept somewhere: without the table (or the cache store below) the app doesn't enrol, and `alls-well:status` says why. Enrolling stops at your plan's site limit, and the refusal names the plan.
 
 ### Apps without a database
 
-Set `ALLS_WELL_STORE=cache` to keep the connection in the app's cache instead. The cache must outlive each run, so the `array` and `null` drivers won't do. Clearing the cache (`php artisan cache:clear`) then loses some of it:
+By default (`ALLS_WELL_STORE=auto`) the connection lives in the `alls_well_state` table. Only an app with a site token falls back to the cache, and only while the database answers but the table doesn't exist yet. A database that can't be reached at all stops reporting, and `alls-well:status` says to set the store. That includes Laravel 11 and later on their default SQLite connection when the database file doesn't exist.
+
+So an app with no database, or one the scheduler can't reach, sets `ALLS_WELL_STORE=cache`, with a site token or the key. `alls-well:install` then leaves the database alone, and the connection lives in the app's cache. The cache must outlive each run, so the `array` and `null` drivers won't do. Clearing the cache (`php artisan cache:clear`) then loses some of it:
 
 - **With a site token,** it forgets when the app last reported, any back-off after failures, and any pause, including a disconnect made with `alls-well:disconnect`. Reporting carries on with the token, and the next scheduled run reports at once.
 - **With the key,** it also loses the site token the key enrolled. The app then enrols again, and All's Well refuses (`409 site_exists`) while the site is still reporting. So the site goes Down first; then All's Well gives the app a new token for the same site and tells your team. Keep the key on the database where you can.
-
-Without `ALLS_WELL_STORE`, a token-mode app keeps its connection in the cache only until the `alls_well_state` table exists.
 
 ### Apps on several servers
 
@@ -128,7 +132,7 @@ The command exits with `0` when it worked (or no report was due), `1` when it di
 
 ### The config file
 
-For settings `.env` can't hold, add `alls-well.php` to the project root (or name another file with `--config=PATH`). It returns an array, and the environment variables above win over its values:
+For settings `.env` can't hold, add `alls-well.php` to the project root (or name another file with `--config=PATH`). It returns an array, and the `ALLS_WELL_*` variables above win over its values. `APP_ENV` doesn't: to override the file's `environment`, set `ALLS_WELL_ENVIRONMENT`.
 
 ```php
 <?php
@@ -183,6 +187,8 @@ if ($result->needsAttention()) {
 }
 ```
 
+It takes the config file's keys, plus `state`: a `StateStore`, such as `FileStateStore`, where the reporter remembers its connection between calls. Without `state` nothing is remembered: `report()` sends every time, the key can't enrol, and `disconnect()` refuses.
+
 `report()` sends a report once one is due. The reporter also has `connect()`, `disconnect()` and `status()`. Each returns a `Result` with `isSuccess()`, `needsAttention()` and `message()`, except `status()`, which returns an array. None of them throws.
 
 ## What it sends, and what it never sends
@@ -192,7 +198,7 @@ A report carries:
 - the site's address, name and environment name;
 - the versions of PHP, the framework and the database server;
 - the name and version of every Composer package installed for production;
-- each check's result: pass, warn, fail or info, a label and a short value, such as a count or the mail transport's name;
+- each check's result: pass, warn, fail or info, its severity, a label, a short value, such as a count or the mail transport's name, and the detail your own checks add. A check that throws is sent as failed, naming only the exception's class;
 - administrators' IDs, logins and registration dates, only when you opt in. A login that is an email address is masked (`jane@example.com` is sent as `j***@example.com`); any other login is sent as it is.
 
 It never sends other `.env` values, passwords or keys, request data, file paths, or anything about your users beyond the administrators you opt in to report. When something fails, the package logs the exception's class, never its message, since that can carry paths or values.
@@ -206,8 +212,8 @@ It never sends other `.env` values, passwords or keys, request data, file paths,
 | `laravel.debug` | Debug mode is off. It fails in production. |
 | `laravel.environment` | The environment's name. |
 | `laravel.app_key` | `APP_KEY` is set. |
-| `laravel.https` | `APP_URL` uses https. |
-| `laravel.secure_cookies` | Session cookies are marked secure. |
+| `laravel.https` | `APP_URL` uses https. Laravel builds links outside a request, such as those in queued mail, from `APP_URL`, so this looks at it even when `ALLS_WELL_SITE_URL` is set. |
+| `laravel.secure_cookies` | Session cookies are marked secure, on a site whose address (`ALLS_WELL_SITE_URL`, else `APP_URL`) is https. |
 | `laravel.mail` | The default mailer sends mail, rather than logging it. |
 | `laravel.config_cached` | The configuration is cached. |
 | `laravel.routes_cached` | The routes are cached. |
@@ -221,11 +227,13 @@ It never sends other `.env` values, passwords or keys, request data, file paths,
 
 The debug, mail, https, secure-cookie and cache checks, and `php.dev_packages`, only warn or fail in production (an environment named `production`, `prod` or `live`); elsewhere they report for information. The others apply everywhere.
 
-The migrations check counts the package's own migration as pending until `php artisan migrate` (or `alls-well:install`) has run.
+The migrations check counts the package's own migration as pending until `php artisan migrate` (or `alls-well:install`, unless `ALLS_WELL_STORE=cache`) has run.
 
 ### Your own checks
 
-A check returns a `CheckResult`: `pass`, `warn`, `fail` or `info`, with a label, a severity (`critical`, `high`, `medium`, `low` or `info`) and an optional value. Its key is lowercase letters, digits, dots, dashes and underscores, such as `app.stripe`, and can't start with `server.` or `addon.`. A check that throws is reported as failed, and never stops the report.
+A check returns a `CheckResult`: `pass`, `warn`, `fail` or `info`, with a label, a severity (`critical`, `high`, `medium`, `low` or `info`) and an optional value. Its key starts with a lowercase letter or digit, then uses lowercase letters, digits, dots, dashes and underscores, up to 191 characters, such as `app.stripe`. It can't start with `server.` or `addon.`. A check with an invalid key is skipped, and the report says so (`addon.invalid_checks`). A check that throws is reported as failed, and never stops the report.
+
+A check already reported that moves into `fail` at `critical` or `high` severity alerts your team; a check seen for the first time is recorded without alerting. It alerts again only once it has been out of `fail` for 24 hours. Other results show on the site page without alerting.
 
 In Laravel, list check classes in `config/alls_well.php`. Each implements `AgilePixel\AllsWell\Checks\Check`, or is invokable, and comes from the container. `null` turns a `laravel.*` check off:
 
@@ -253,7 +261,7 @@ class StripeCheck implements Check
 }
 ```
 
-Closures don't belong in the config file, because `php artisan config:cache` can't store them. Register them from a service provider's `boot()` instead:
+Closures in the config file are ignored, and `php artisan config:cache` couldn't store them anyway. Register them from a service provider's `boot()` instead:
 
 ```php
 use AgilePixel\AllsWell\Checks\CheckResult;
@@ -268,7 +276,7 @@ Other PHP apps return their checks from `alls-well.php`, as functions or `Check`
 
 ### spatie/laravel-health
 
-When [spatie/laravel-health](https://github.com/spatie/laravel-health) is installed with a result store, its latest stored results are reported as checks, keyed `health.<name>`: ok passes, warning warns, failed and crashed fail, and anything else is information. The package doesn't run those checks again, so schedule them as that package describes.
+When [spatie/laravel-health](https://github.com/spatie/laravel-health) is installed with a result store, its latest stored results are reported as checks, keyed `health.` plus the check's name in lower case, with anything other than letters, digits, dots, dashes and underscores replaced by `-` (`UsedDiskSpace` becomes `health.useddiskspace`): ok passes, warning warns, failed and crashed fail, and anything else is information. The package doesn't run those checks again, so schedule them as that package describes.
 
 ### Administrators
 
@@ -295,18 +303,18 @@ Or name an invokable class as `administrators` in `config/alls_well.php`. Other 
 |---|---|
 | `php artisan alls-well:install` | Publishes the config file, creates the `alls_well_state` table (asking first), connects and sends the first report. |
 | `php artisan alls-well:connect` | Connects now, even while backing off after failures, and sends a report. It ends a disconnect; with the key, it also enrols a deleted site again, as a new site. |
-| `php artisan alls-well:report` | Sends the report when one is due; `--manual` sends it whether or not one is due, unless the package is backing off after a failure. The scheduler runs it every hour. It prints nothing unless something needs fixing; `-v` shows every outcome. |
+| `php artisan alls-well:report` | Sends the report when one is due; `--manual` sends it whether or not one is due, unless the package is backing off after a failure or paused. The scheduler runs it every hour. It prints nothing unless something needs fixing (`-v` shows every outcome), and then also writes it to the app's log as a warning, since the scheduler discards what it prints. |
 | `php artisan alls-well:status` | Shows the settings, the connection, the last result and the schedule. It sends nothing. |
-| `php artisan alls-well:disconnect` | Tells All's Well the site is going, and stops reporting until `alls-well:connect`. It asks first, so scripts need `--force`. |
+| `php artisan alls-well:disconnect` | Tells All's Well the site is going, and stops reporting until `alls-well:connect`. All's Well then marks a reporting site Down ("Package removed") and alerts your team. It asks first, so scripts need `--force`. |
 
 ### Other PHP apps
 
 | Command | What it does |
 |---|---|
-| `vendor/bin/alls-well report` | Sends the report when one is due; `--manual` sends it whether or not one is due, unless the package is backing off after a failure. `-v` shows every outcome. |
+| `vendor/bin/alls-well report` | Sends the report when one is due; `--manual` sends it whether or not one is due, unless the package is backing off after a failure or paused. `-v` shows every outcome. |
 | `vendor/bin/alls-well connect` | Connects now, even while backing off after failures, and sends a report. It ends a disconnect; with the key, it also enrols a deleted site again, as a new site. |
 | `vendor/bin/alls-well status` | Shows the settings and the state. It sends nothing. |
-| `vendor/bin/alls-well disconnect` | Tells All's Well the site is going, and stops reporting until `connect`. It needs `ALLS_WELL_STATE_PATH`. |
+| `vendor/bin/alls-well disconnect` | Tells All's Well the site is going, and stops reporting until `connect`. All's Well then marks a reporting site Down ("Package removed") and alerts your team. It needs `ALLS_WELL_STATE_PATH`. |
 
 Each takes `--config=PATH` to read another config file. `--help` lists the commands and options, and `--version` shows the package's version.
 
@@ -323,7 +331,7 @@ In Laravel, `php artisan alls-well:install` publishes `config/alls_well.php`; `p
 | `ALLS_WELL_SITE_NAME` | `site_name` | `APP_NAME` in Laravel, unless it's `Laravel`; otherwise the site's host | The name the site is reported under. |
 | `ALLS_WELL_ENVIRONMENT` | `environment` | the app's environment (`APP_ENV`) | The environment name reported. |
 | `ALLS_WELL_ENABLED` | `enabled` | on | `false`, `0`, `off` or `no` turns reporting off without removing the package. |
-| `ALLS_WELL_STORE` | `store` | `auto` | Laravel only: where the connection is kept. `auto` uses the `alls_well_state` table (or, with a site token, the cache until the table exists); `database` or `cache` forces one. |
+| `ALLS_WELL_STORE` | `store` | `auto` | Laravel only: where the connection is kept. `auto` uses the `alls_well_state` table; with a site token, it uses the cache while the database answers but the table doesn't exist yet. `database` or `cache` forces one: an app without a reachable database needs `cache`. |
 | `ALLS_WELL_STATE_PATH` | none | none | Other PHP apps only: the file where the connection and state are kept. |
 | none | `skip_environments` | `['local', 'testing']` | Laravel only: environments that never report or schedule anything. |
 | none | `schedule` | `true` | Laravel only: `false` leaves scheduling `alls-well:report` to you. |
@@ -346,11 +354,11 @@ In Laravel, `php artisan alls-well:install` publishes `config/alls_well.php`; `p
 
 - **A copy with the key,** such as a staging app cloned from production, enrols as a new site under its own address. The connection it copied belongs to the address it was made for, so it never reports as the original.
 - **A copy with the site token** is refused by All's Well (`site_moved`), and pauses until you fix it. Give the copy a site of its own, and its token.
-- **To move an app to a new domain,** change the site's address in All's Well, deploy the app at its new address, then run `connect`. With the key, also set `ALLS_WELL_TOKEN` to the site's token (on the site page in All's Well): otherwise the app at its new address enrols as a new site.
+- **To move an app to a new domain,** change the site's address in All's Well, deploy the app at its new address, then run `connect`. With the key, also set `ALLS_WELL_TOKEN` to the site's token (on the site page in All's Well). Otherwise the app at its new address forgets its connection and enrols again, and All's Well refuses it (`409 site_exists`) until the site goes Down; then it gives the app a new token for the same site and alerts your team.
 
 ## Troubleshooting
 
-Start with `php artisan alls-well:status` (or `vendor/bin/alls-well status`). It sends nothing, and lists anything to fix under `errors`.
+Start with `php artisan alls-well:status` (or `vendor/bin/alls-well status`). It sends nothing, and lists anything to fix under `errors`. The command line prints `name: value` lines and Laravel a table, with the same names, which the list below uses.
 
 - **`paused: site_moved`:** All's Well refused a report from this address, and `last_error` says why. If the app moved, change the site's address in All's Well. If it's a copy, give it its own site token. Then run `connect`.
 - **`last_status: 409` with "This site is already connected and reporting":** an app with the key tried to enrol (`site_exists`) at an address whose site is still reporting, usually after its stored token was lost. Paste the site's token as `ALLS_WELL_TOKEN`, or delete the site in All's Well.
@@ -358,6 +366,8 @@ Start with `php artisan alls-well:status` (or `vendor/bin/alls-well status`). It
 - **"This site's address … isn't public"** (or `site_url_not_public` from All's Well): the address is localhost or a private network. Set `ALLS_WELL_SITE_URL` to the address the site is served from.
 - **The site is Down in All's Well:** the app stopped reporting, often because the scheduler or the cron line stopped. Check `last_report_at`, and in Laravel that `schedule` says when it runs and that `php artisan schedule:run` runs every minute.
 - **`config cached: yes` and no token found:** the configuration was cached before the token was added. Run `php artisan config:clear`, or `config:cache` again.
+- **An enrolment refused at the site limit:** your plan's site allowance is used up, and the message names the plan. Delete a site you no longer need, or upgrade.
+- **"The database couldn't be reached":** the app keeps its connection in the database, which the scheduler can't reach. Set `ALLS_WELL_STORE=cache` (see [Apps without a database](#apps-without-a-database)).
 
 ## Updating and removing
 
@@ -367,7 +377,7 @@ Update with Composer. The site page in All's Well says when a newer version exis
 composer update agilepixel/alls-well-php
 ```
 
-To remove it, disconnect first, so All's Well knows the site is going, then remove the package and the `ALLS_WELL_*` settings:
+To remove it, first delete any `AllsWell::check()` and `AllsWell::administrators()` calls from your service providers: once the package is gone, that class is too, and every request would fail. Then disconnect, so All's Well knows the site is going, and remove the package, `config/alls_well.php` and the `ALLS_WELL_*` settings:
 
 ```sh
 php artisan alls-well:disconnect --force

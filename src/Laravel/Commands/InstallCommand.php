@@ -8,7 +8,8 @@ use AgilePixel\AllsWell\Support\Credentials;
 
 /**
  * The one step after setting ALLS_WELL_TOKEN: publishes the config, creates
- * the state table, connects and says what runs next.
+ * the state table (unless ALLS_WELL_STORE=cache keeps the state in the
+ * cache), connects and says what runs next.
  */
 class InstallCommand extends AllsWellCommand
 {
@@ -36,7 +37,8 @@ class InstallCommand extends AllsWellCommand
         }
         $keyMode = $credentials->siteToken() === null;
 
-        if (! StateStores::hasTable($this->laravel) && ! $this->createTable($keyMode)) {
+        if (StateStores::setting($this->laravel) !== 'cache'
+            && ! StateStores::hasTable($this->laravel) && ! $this->createTable($keyMode)) {
             return 1;
         }
 
