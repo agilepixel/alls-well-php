@@ -73,6 +73,38 @@ final class Url
     }
 
     /**
+     * Host (no "www."), or null without one.
+     *
+     * @param  string  $url
+     * @return string|null
+     */
+    public static function hostKey($url)
+    {
+        $host = parse_url(trim($url), PHP_URL_HOST);
+        if (! is_string($host) || $host === '') {
+            return null;
+        }
+
+        $host = self::asciiHost($host);
+
+        return substr($host, 0, 4) === 'www.' ? substr($host, 4) : $host;
+    }
+
+    /**
+     * Whether the URL holds a username or password, which would show wherever
+     * the address does.
+     *
+     * @param  string  $url
+     * @return bool
+     */
+    public static function hasCredentials($url)
+    {
+        $parts = parse_url(trim($url));
+
+        return is_array($parts) && (isset($parts['user']) || isset($parts['pass']));
+    }
+
+    /**
      * @param  string  $a
      * @param  string  $b
      * @return bool
@@ -110,7 +142,7 @@ final class Url
             return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
         }
 
-        foreach (['.localhost', '.test', '.local', '.internal', '.invalid', '.example'] as $suffix) {
+        foreach (['.localhost', '.test', '.local', '.internal', '.invalid', '.example', '.ddev.site', '.lndo.site'] as $suffix) {
             if (substr($host, -strlen($suffix)) === $suffix) {
                 return false;
             }

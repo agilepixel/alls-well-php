@@ -8,19 +8,30 @@ namespace AgilePixel\AllsWell\Report;
 final class Runtime
 {
     /**
+     * The Composer package whose version a platform reports as its own.
+     *
+     * @var array<string, string>
+     */
+    const PLATFORM_PACKAGES = [
+        'laravel' => 'laravel/framework',
+        'craft' => 'craftcms/cms',
+    ];
+
+    /**
      * @param  string  $platform
+     * @param  string  $php  The PHP version, which is the platform's own when no package is.
      * @return string
      */
-    public static function platformVersion($platform, ComposerPackages $packages)
+    public static function platformVersion($platform, ComposerPackages $packages, $php = PHP_VERSION)
     {
-        if ($platform === 'laravel') {
-            $version = $packages->version('laravel/framework');
+        if (isset(self::PLATFORM_PACKAGES[$platform])) {
+            $version = $packages->version(self::PLATFORM_PACKAGES[$platform]);
             if ($version !== null && $version !== '') {
                 return $version;
             }
         }
 
-        return PHP_VERSION;
+        return $php;
     }
 
     /**

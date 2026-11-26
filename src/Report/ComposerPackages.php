@@ -10,12 +10,19 @@ use Composer\InstalledVersions;
 final class ComposerPackages
 {
     /**
+     * The Craft CMS plugin built on this package. It reports for the site, so
+     * the package's own Laravel integration and command step aside.
+     */
+    const CRAFT_PLUGIN = 'agilepixel/craft-alls-well';
+
+    /**
      * Frameworks in the order they are looked for: package => label.
      *
      * @var array<string, string>
      */
     const FRAMEWORKS = [
         'laravel/framework' => 'Laravel',
+        'craftcms/cms' => 'Craft CMS',
         'symfony/framework-bundle' => 'Symfony',
         'codeigniter4/framework' => 'CodeIgniter',
         'slim/slim' => 'Slim',
@@ -85,6 +92,17 @@ final class ComposerPackages
         }
 
         return null;
+    }
+
+    /**
+     * Whether a package is installed, without reading the whole list.
+     *
+     * @param  string  $name
+     * @return bool
+     */
+    public static function isInstalled($name)
+    {
+        return class_exists('Composer\InstalledVersions') && InstalledVersions::isInstalled($name);
     }
 
     /**

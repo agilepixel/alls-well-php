@@ -129,7 +129,15 @@ final class Application
             return $this->usage('--config needs a path.');
         }
 
-        if ($this->isLaravelApp($projectRoot)) {
+        $packages = $this->packages !== null ? $this->packages : new ComposerPackages;
+
+        if ($packages->has(ComposerPackages::CRAFT_PLUGIN)) {
+            fwrite($this->stderr, "This site reports through the All's Well plugin for Craft CMS: use php craft alls-well/report (and the other alls-well/ commands) instead.\n");
+
+            return 1;
+        }
+
+        if ($packages->has('laravel/framework') && is_file(rtrim($projectRoot, '/\\').'/artisan')) {
             fwrite($this->stderr, "This is a Laravel app: use php artisan alls-well:report (and the other alls-well: commands) instead.\n");
 
             return 1;
@@ -221,13 +229,6 @@ final class Application
         }
 
         return call_user_func($this->transportFactory);
-    }
-
-    private function isLaravelApp(string $projectRoot): bool
-    {
-        $packages = $this->packages !== null ? $this->packages : new ComposerPackages;
-
-        return $packages->has('laravel/framework') && is_file(rtrim($projectRoot, '/\\').'/artisan');
     }
 
     /**

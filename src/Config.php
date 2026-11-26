@@ -21,6 +21,8 @@ final class Config
 
     const DEFAULT_TIMEOUT = 15;
 
+    const PLATFORMS = ['php', 'laravel', 'craft'];
+
     /** @var string|null */
     private $origin;
 
@@ -48,14 +50,38 @@ final class Config
     /** @var StateStore */
     private $state;
 
+    /** @var bool */
+    private $keepsConnection;
+
+    /** @var string|null */
+    private $boundEnvironment;
+
     /** @var Wording */
     private $wording;
 
     /** @var array<int|string, mixed> */
     private $checks;
 
+    /** @var array<int|string, mixed> */
+    private $hostChecks;
+
+    /** @var callable|null */
+    private $components;
+
     /** @var callable|null */
     private $administrators;
+
+    /** @var string */
+    private $addonVersion;
+
+    /** @var string|null */
+    private $platformVersion;
+
+    /** @var string|null */
+    private $phpVersion;
+
+    /** @var bool|null */
+    private $multisite;
 
     /** @var \PDO|callable|null */
     private $pdoSource;
@@ -84,15 +110,23 @@ final class Config
         $config->siteName = self::text($settings, 'site_name');
         $config->environment = self::text($settings, 'environment');
         $config->enabled = isset($settings['enabled']) && is_bool($settings['enabled']) ? $settings['enabled'] : true;
-        $config->platform = isset($settings['platform']) && $settings['platform'] === 'laravel' ? 'laravel' : 'php';
+        $config->platform = isset($settings['platform']) && in_array($settings['platform'], self::PLATFORMS, true) ? $settings['platform'] : 'php';
+        $config->addonVersion = self::version($settings, 'addon_version', 32) ?: AllsWell::VERSION;
+        $config->platformVersion = self::version($settings, 'platform_version', 64);
+        $config->phpVersion = self::version($settings, 'php_version', 64);
+        $config->multisite = isset($settings['multisite']) && is_bool($settings['multisite']) ? $settings['multisite'] : null;
         $config->timeout = self::timeoutFrom($settings);
         $config->state = isset($settings['state']) && $settings['state'] instanceof StateStore
             ? $settings['state']
             : new MemoryStateStore;
+        $config->keepsConnection = isset($settings['stored_connection']) && $settings['stored_connection'] === true;
+        $config->boundEnvironment = self::text($settings, 'bind_environment');
         $config->wording = isset($settings['wording']) && $settings['wording'] instanceof Wording
             ? $settings['wording']
             : Wording::cli();
         $config->checks = isset($settings['checks']) && is_array($settings['checks']) ? $settings['checks'] : [];
+        $config->hostChecks = isset($settings['host_checks']) && is_array($settings['host_checks']) ? $settings['host_checks'] : [];
+        $config->components = self::callable($settings, 'components');
         $config->administrators = self::callable($settings, 'administrators');
         $config->logger = self::callable($settings, 'logger');
 
@@ -172,11 +206,43 @@ final class Config
     }
 
     /**
-     * @return string 'php' or 'laravel'.
+     * @return string One of PLATFORMS.
      */
     public function platform()
     {
         return $this->platform;
+    }
+
+    /**
+     * @return string The reporting add-on's version: the host's own, or the package's.
+     */
+    public function addonVersion()
+    {
+        return $this->addonVersion;
+    }
+
+    /**
+     * @return string|null The platform's version as the host knows it; null to read it from Composer.
+     */
+    public function platformVersion()
+    {
+        return $this->platformVersion;
+    }
+
+    /**
+     * @return string|null The PHP version to report instead of the running one, for a host whose command line runs another.
+     */
+    public function phpVersion()
+    {
+        return $this->phpVersion;
+    }
+
+    /**
+     * @return bool|null Null when the platform has no such thing.
+     */
+    public function multisite()
+    {
+        return $this->multisite;
     }
 
     /**
@@ -196,6 +262,22 @@ final class Config
     }
 
     /**
+     * @return bool Whether a connection made by hand, and kept in the state, may be used.
+     */
+    public function keepsConnection()
+    {
+        return $this->keepsConnection;
+    }
+
+    /**
+     * @return string|null The environment a kept connection belongs to, so a copy of its state elsewhere isn't this site.
+     */
+    public function boundEnvironment()
+    {
+        return $this->boundEnvironment;
+    }
+
+    /**
      * @return Wording
      */
     public function wording()
@@ -209,6 +291,24 @@ final class Config
     public function checks()
     {
         return $this->checks;
+    }
+
+    /**
+     * The host's own checks, which may use the addon. prefix.
+     *
+     * @return array<int|string, mixed>
+     */
+    public function hostChecks()
+    {
+        return $this->hostChecks;
+    }
+
+    /**
+     * @return callable|null Returns the host's components, in the protocol's shape.
+     */
+    public function components()
+    {
+        return $this->components;
     }
 
     /**
@@ -260,32 +360,52 @@ final class Config
     }
 
     /**
+     * What the site reports with: the site token that is set, else a
+     * connection the set key enrols, else one kept in the state.
+     *
+     * @return 'token'|'key'|'stored'|null Null when there is nothing to report with.
+     */
+    public function mode()
+    {
+        if ($this->credentials->siteToken() !== null) {
+            return 'token';
+        }
+        if ($this->credentials->enrolmentKey() !== null) {
+            return 'key';
+        }
+
+        return $this->keepsConnection ? 'stored' : null;
+    }
+
+    /**
      * @return bool Whether an enrolment key is set and no site token.
      */
     public function isKeyMode()
     {
-        return $this->credentials->enrolmentKey() !== null && $this->credentials->siteToken() === null;
+        return $this->mode() === 'key';
     }
 
     /**
      * What the owner must fix before any report can be sent.
      *
+     * @param  bool  $enrolling  Whether the set key may have to enrol, which needs somewhere to keep the token.
      * @return string[]
      */
-    public function errors()
+    public function errors($enrolling = true)
     {
         $errors = [];
+        $setting = $this->wording->addressSetting();
 
         if ($this->siteUrl === null) {
-            $errors[] = 'Set ALLS_WELL_SITE_URL to the address this site is served from.';
+            $errors[] = 'Set '.$setting.' to the address this site is served from.';
         } elseif (preg_match('#^https?://#i', $this->siteUrl) !== 1) {
-            $errors[] = 'ALLS_WELL_SITE_URL must start with https:// (or http://).';
+            $errors[] = ucfirst($setting).' must start with https:// (or http://).';
         } elseif (Url::normaliseOrigin($this->siteUrl) === null || ! Url::isPublic($this->siteUrl)) {
             $errors[] = "This site's address (".$this->siteUrl.") isn't public (localhost or a private network). "
-                .'Set ALLS_WELL_SITE_URL to the address the site is served from.';
+                .'Set '.$setting.' to the address the site is served from.';
         }
 
-        if ($this->credentials->siteToken() === null && $this->credentials->enrolmentKey() === null) {
+        if ($this->mode() === null) {
             $errors[] = "Set ALLS_WELL_TOKEN to this site's token, or ALLS_WELL_KEY to your team's enrolment key.";
         }
 
@@ -297,7 +417,7 @@ final class Config
             $errors[] = 'ALLS_WELL_URL is not a valid http(s) address.';
         }
 
-        if ($this->isKeyMode() && ! $this->state->isPersistent()) {
+        if ($enrolling && $this->isKeyMode() && ! $this->state->isPersistent()) {
             $errors[] = $this->wording->keyNeedsState();
         }
 
@@ -318,6 +438,19 @@ final class Config
         $value = trim($settings[$key]);
 
         return $value === '' ? null : $value;
+    }
+
+    /**
+     * @param  array<string, mixed>  $settings
+     * @param  string  $key
+     * @param  int  $limit
+     * @return string|null Null when it is longer than the protocol allows.
+     */
+    private static function version(array $settings, $key, $limit)
+    {
+        $value = self::text($settings, $key);
+
+        return $value !== null && strlen($value) <= $limit ? $value : null;
     }
 
     /**

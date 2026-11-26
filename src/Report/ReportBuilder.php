@@ -2,7 +2,6 @@
 
 namespace AgilePixel\AllsWell\Report;
 
-use AgilePixel\AllsWell\AllsWell;
 use AgilePixel\AllsWell\Checks\CheckResult;
 use AgilePixel\AllsWell\Checks\CheckRunner;
 use AgilePixel\AllsWell\Checks\DevPackagesCheck;
@@ -22,6 +21,13 @@ final class ReportBuilder
     const MAX_CHECKS = 100;
 
     const MAX_ADMINISTRATORS = 200;
+
+    const COMPONENT_TYPES = ['core', 'plugin', 'theme', 'module', 'package'];
+
+    /**
+     * The check keys only the package itself reports.
+     */
+    const PACKAGE_CHECKS = [DevPackagesCheck::KEY, 'addon.components_trimmed', 'addon.invalid_checks'];
 
     /**
      * @var Config
@@ -75,18 +81,18 @@ final class ReportBuilder
         $report = [
             'protocol' => 1,
             'platform' => $this->config->platform(),
-            'addon_version' => AllsWell::VERSION,
+            'addon_version' => $this->config->addonVersion(),
             'reported_at' => gmdate('c', $now),
             'reason' => $reason,
             'site' => [
                 'url' => (string) $this->config->siteUrl(),
                 'name' => self::cut($this->config->siteName(), 255),
                 'environment' => self::environment($this->config->environment()),
-                'multisite' => null,
+                'multisite' => $this->config->multisite(),
             ],
             'runtime' => [
                 'platform_version' => $this->platformVersion(),
-                'language' => ['name' => 'php', 'version' => PHP_VERSION],
+                'language' => ['name' => 'php', 'version' => $this->phpVersion()],
                 'database' => $this->database(),
                 'server' => null,
             ],
@@ -97,8 +103,8 @@ final class ReportBuilder
         }
 
         $trimmed = null;
-        if ($this->packages->isAvailable()) {
-            $components = $this->components();
+        $components = $this->components();
+        if ($components !== null) {
             $trimmed = count($components) > self::MAX_COMPONENTS ? count($components) : null;
             $report['components'] = array_slice($components, 0, self::MAX_COMPONENTS);
         }
@@ -117,9 +123,22 @@ final class ReportBuilder
      */
     private function platformVersion()
     {
-        $version = Runtime::platformVersion($this->config->platform(), $this->packages);
+        $version = $this->config->platformVersion();
+        if ($version === null) {
+            $version = Runtime::platformVersion($this->config->platform(), $this->packages, $this->phpVersion());
+        }
 
-        return $version === '' || strlen($version) > 64 ? PHP_VERSION : $version;
+        return $version === '' || strlen($version) > 64 ? $this->phpVersion() : $version;
+    }
+
+    /**
+     * @return string
+     */
+    private function phpVersion()
+    {
+        $version = $this->config->phpVersion();
+
+        return $version === null ? PHP_VERSION : $version;
     }
 
     /**
@@ -146,20 +165,42 @@ final class ReportBuilder
     }
 
     /**
-     * @return array<int, array<string, mixed>>
+     * The host's components, then Composer's: the host knows its plugins by
+     * their own names, so its entry replaces Composer's for the same package,
+     * and its core makes Composer's framework an ordinary package.
+     *
+     * @return array<int, array<string, mixed>>|null Null when either couldn't be read: sending what is left would clear the stored rest.
      */
     private function components()
     {
-        $components = [];
+        $components = $this->hostComponents();
+        if ($components === null || ! $this->packages->isAvailable()) {
+            return null;
+        }
+
+        $replaced = [];
+        $taken = [];
+        $core = false;
+        foreach ($components as $component) {
+            $taken[$component['type'].':'.$component['slug']] = true;
+            $core = $core || $component['type'] === 'core';
+            if ($component['package']['ecosystem'] === 'Packagist') {
+                $replaced[strtolower($component['package']['name'])] = true;
+            }
+        }
 
         foreach ($this->packages->components() as $component) {
+            if ($core) {
+                $component['type'] = 'package';
+            }
+            if (isset($replaced[strtolower($component['slug'])]) || isset($taken[$component['type'].':'.$component['slug']])) {
+                continue;
+            }
             if (strlen($component['slug']) > 191 || strlen((string) $component['name']) > 255) {
                 continue;
             }
             foreach (['version', 'latest_version'] as $field) {
-                if (is_string($component[$field]) && strlen($component[$field]) > 64) {
-                    $component[$field] = null;
-                }
+                $component[$field] = self::shortText($component[$field], 64);
             }
             $components[] = $component;
         }
@@ -168,16 +209,91 @@ final class ReportBuilder
     }
 
     /**
+     * What the host's resolver returned, one per type and slug. Null when it
+     * failed or none of its items could be used; an empty list is one.
+     *
+     * @return array<int, array<string, mixed>>|null
+     */
+    private function hostComponents()
+    {
+        $resolver = $this->config->components();
+        if ($resolver === null) {
+            return [];
+        }
+
+        try {
+            $items = call_user_func($resolver);
+            if (! is_array($items) && ! $items instanceof \Traversable) {
+                return null;
+            }
+
+            $components = [];
+            $seen = 0;
+            foreach ($items as $item) {
+                $seen++;
+                $component = self::hostComponent($item);
+                if ($component !== null) {
+                    $components += [$component['type'].':'.$component['slug'] => $component];
+                }
+            }
+
+            return $seen > 0 && $components === [] ? null : array_values($components);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  mixed  $item
+     * @return array<string, mixed>|null
+     */
+    private static function hostComponent($item)
+    {
+        if (! is_array($item) || ! isset($item['type'], $item['slug'], $item['package']) || ! is_array($item['package'])) {
+            return null;
+        }
+
+        $slug = self::shortText($item['slug'], 191);
+        $ecosystem = self::shortText(isset($item['package']['ecosystem']) ? $item['package']['ecosystem'] : null, 32);
+        $package = self::shortText(isset($item['package']['name']) ? $item['package']['name'] : null, 191);
+        if (! in_array($item['type'], self::COMPONENT_TYPES, true) || $slug === null || $ecosystem === null || $package === null) {
+            return null;
+        }
+
+        return [
+            'type' => $item['type'],
+            'slug' => $slug,
+            'name' => isset($item['name']) && is_string($item['name']) ? self::cut($item['name'], 255) : null,
+            'version' => self::shortText(isset($item['version']) ? $item['version'] : null, 64),
+            'latest_version' => self::shortText(isset($item['latest_version']) ? $item['latest_version'] : null, 64),
+            'active' => ! isset($item['active']) || $item['active'] !== false,
+            'auto_update' => isset($item['auto_update']) && is_bool($item['auto_update']) ? $item['auto_update'] : null,
+            'package' => ['ecosystem' => $ecosystem, 'name' => $package],
+        ];
+    }
+
+    /**
+     * @param  mixed  $value
+     * @param  int  $limit
+     * @return string|null Null unless it is text the protocol has room for.
+     */
+    private static function shortText($value, $limit)
+    {
+        return is_string($value) && $value !== '' && strlen($value) <= $limit ? $value : null;
+    }
+
+    /**
      * @param  int|null  $trimmedFrom  The component count before trimming, when it was trimmed.
      * @return array<int, array<string, mixed>>
      */
     private function checks($trimmedFrom)
     {
+        $host = array_diff_key($this->config->hostChecks(), array_flip(self::PACKAGE_CHECKS));
         $registry = $this->config->checks();
         unset($registry[DevPackagesCheck::KEY]);
         $registry[DevPackagesCheck::KEY] = new DevPackagesCheck($this->packages, $this->config->environment());
 
-        $results = (new CheckRunner)->run($registry);
+        $results = (new CheckRunner)->run($registry, $host);
 
         if ($trimmedFrom !== null) {
             $results = self::makeRoom($results);
@@ -189,7 +305,7 @@ final class ReportBuilder
     }
 
     /**
-     * Drops the last ordinary result when the list is full, keeping the package's own.
+     * Drops the last result but the package's own when the list is full.
      *
      * @param  array<int, array<string, mixed>>  $results
      * @return array<int, array<string, mixed>>
@@ -201,7 +317,7 @@ final class ReportBuilder
         }
 
         for ($i = count($results) - 1; $i >= 0; $i--) {
-            if (strpos($results[$i]['key'], 'addon.') !== 0) {
+            if (! in_array($results[$i]['key'], self::PACKAGE_CHECKS, true)) {
                 unset($results[$i]);
 
                 break;

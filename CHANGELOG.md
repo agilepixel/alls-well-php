@@ -2,6 +2,17 @@
 
 The notable changes in each release, newest first. Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.1.0
+
+- A CMS plugin, or any host with screens of its own, can now be built on the package. The README's "Building on the package" lists what it can use:
+  - connecting with a button, or with a token or key someone types, and reporting with the connection its state store keeps;
+  - its own platform (`craft` is now one), versions, components, checks and wording.
+- A copy of such a host's stored connection, at another address or in another environment, sends nothing, unless `ALLS_WELL_KEY` is set to enrol it as a site of its own.
+- A Craft CMS site that reports through the command line now shows Craft CMS as its core, instead of Yii.
+- Where the All's Well plugin for Craft CMS is installed, the package's command and Laravel integration step aside for it.
+- Addresses ending in `.ddev.site` or `.lndo.site` (DDEV and Lando) count as local, as they do in All's Well. An app at one no longer reports.
+- `status` shows the site's page in All's Well (`dashboard_url`), once the package knows it, and when the next report is due (`next_report_at`).
+
 ## 1.0.1
 
 - `php artisan alls-well:install` with `ALLS_WELL_STORE=cache` no longer tries to create the `alls_well_state` table. With the team key on an app without a database, it stopped there; now it connects.

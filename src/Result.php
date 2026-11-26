@@ -10,6 +10,9 @@ final class Result
 {
     const SENT = 'sent';
 
+    /** Connected by hand, with the first report still to go. */
+    const CONNECTED = 'connected';
+
     const SKIPPED = 'skipped';
 
     const PAUSED = 'paused';
@@ -57,7 +60,7 @@ final class Result
 
     public function isSuccess(): bool
     {
-        return $this->outcome === self::SENT || $this->outcome === self::SKIPPED;
+        return in_array($this->outcome, [self::SENT, self::CONNECTED, self::SKIPPED], true);
     }
 
     public function needsAttention(): bool

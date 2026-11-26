@@ -6,7 +6,7 @@ use AgilePixel\AllsWell\Http\CurlTransport;
 
 final class AllsWell
 {
-    const VERSION = '1.0.1';
+    const VERSION = '1.1.0';
 
     const DEFAULT_ORIGIN = 'https://alls-well.io';
 

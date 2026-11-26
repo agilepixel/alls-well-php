@@ -14,13 +14,15 @@ final class State
 
     const PAUSED_MOVED = 'moved';
 
+    const PAUSED_ENVIRONMENT = 'environment';
+
     const PAUSED_SITE_MOVED = 'site_moved';
 
     const DEFAULT_INTERVAL = 3600;
 
     const STRING_FIELDS = [
         'site_token', 'site_id', 'origin', 'report_url', 'dashboard_url',
-        'enrolled_site_key', 'last_error',
+        'enrolled_site_key', 'enrolled_environment', 'last_error',
     ];
 
     const INT_FIELDS = [
@@ -34,7 +36,7 @@ final class State
 
     const CONNECTION_FIELDS = [
         'site_token', 'site_id', 'origin', 'report_url', 'dashboard_url',
-        'enrolled_site_key', 'last_report_at',
+        'enrolled_site_key', 'enrolled_environment', 'made_here', 'last_report_at',
     ];
 
     /** @var array<string, mixed> */
@@ -77,8 +79,10 @@ final class State
 
         $paused = isset($data['paused']) ? $data['paused'] : null;
         $clean['paused'] = in_array($paused, [
-            self::PAUSED_DELETED, self::PAUSED_DISCONNECTED, self::PAUSED_MOVED, self::PAUSED_SITE_MOVED,
+            self::PAUSED_DELETED, self::PAUSED_DISCONNECTED, self::PAUSED_MOVED, self::PAUSED_SITE_MOVED, self::PAUSED_ENVIRONMENT,
         ], true) ? $paused : null;
+
+        $clean['made_here'] = isset($data['made_here']) && in_array($data['made_here'], [true, 1, '1'], true);
 
         return new self($clean);
     }
@@ -109,6 +113,8 @@ final class State
             'report_url' => $this->data['report_url'],
             'dashboard_url' => $this->data['dashboard_url'],
             'enrolled_site_key' => $this->data['enrolled_site_key'],
+            'enrolled_environment' => $this->data['enrolled_environment'],
+            'made_here' => $this->data['made_here'],
             'interval_seconds' => $this->data['interval_seconds'],
             'paused' => $this->data['paused'],
             'backoff_until' => $this->data['backoff_until'],
@@ -187,6 +193,18 @@ final class State
     public function enrolledSiteKey()
     {
         return $this->data['enrolled_site_key'];
+    }
+
+    /** @return string|null The environment the connection was made in, where the host names one. */
+    public function enrolledEnvironment()
+    {
+        return $this->data['enrolled_environment'];
+    }
+
+    /** @return bool Whether the connection was made here, rather than copied from ALLS_WELL_TOKEN. */
+    public function wasMadeHere()
+    {
+        return $this->data['made_here'];
     }
 
     /** @return int */

@@ -2,6 +2,7 @@
 
 namespace AgilePixel\AllsWell;
 
+use AgilePixel\AllsWell\Connect\AuthorizationRequest;
 use AgilePixel\AllsWell\Http\Response;
 use AgilePixel\AllsWell\Report\ComposerPackages;
 use AgilePixel\AllsWell\Report\ReportBuilder;
@@ -12,7 +13,7 @@ use AgilePixel\AllsWell\Support\Url;
 
 /**
  * Decides whether to enrol, report, pause or wait, sends the report and
- * records the answer from All's Well. It never throws: whatever fails comes
+ * records the answer from All's Well. Only authorizationRequest() can throw: whatever else fails comes
  * back as a failed Result and one log line naming only the exception's class.
  *
  * A key-mode connection belongs to the address it was enrolled for. A copy of
@@ -45,6 +46,10 @@ final class Reporter
     const SITE_MOVED_FALLBACK = "All's Well refused a report from this site's address.";
 
     const SITE_NAME_LIMIT = 255;
+
+    private const FIRST_REPORT = 'Connected. The first report will be tried again: ';
+
+    private const REPLACE = 'This site is already connected to All\'s Well and reporting. Click Connect again and tick "Replace the existing connection".';
 
     /** @var Config */
     private $config;
@@ -84,7 +89,8 @@ final class Reporter
     public function report(string $reason = 'scheduled'): Result
     {
         try {
-            $refusal = $this->refusal();
+            $light = in_array($reason, ReportBuilder::LIGHT_REASONS, true);
+            $refusal = $light && $this->isFarewell() ? null : $this->refusal();
             if ($refusal !== null) {
                 return $refusal;
             }
@@ -100,8 +106,10 @@ final class Reporter
                 return $unusable;
             }
 
-            if ($this->config->isKeyMode()) {
-                $connection = $this->keyModeConnection($state, in_array($reason, ReportBuilder::LIGHT_REASONS, true), $now);
+            if ($this->config->mode() !== 'token') {
+                $connection = $this->config->isKeyMode()
+                    ? $this->keyModeConnection($state, $light, $now)
+                    : $this->storedConnection($state, $light);
                 if ($connection instanceof Result) {
                     return $connection;
                 }
@@ -128,7 +136,10 @@ final class Reporter
      * stays one site in All's Well, and keeps reporting with that token if
      * re-enrolling fails; a copy enrols as a new site. Once connected it
      * sends an `activated` report, whatever the back-off, and returns how
-     * that went.
+     * that went. A connection kept in the state is resumed, but never made
+     * here: connectWithCode() and connectWithCredential() make one. With a
+     * key, one made in another environment is let go only once enrolling has
+     * given another, since the environment may only have been renamed.
      */
     public function connect(): Result
     {
@@ -147,15 +158,29 @@ final class Reporter
             $state = $this->loadState()->with(['paused' => null]);
 
             if (! $this->config->isKeyMode()) {
+                $unmade = $this->config->mode() === 'stored' ? $this->unmadeConnection($state) : null;
+                if ($unmade !== null) {
+                    return $unmade;
+                }
                 $failed = $this->save($state);
 
                 return $failed !== null ? $failed : $this->send('activated', $state, $now);
             }
 
-            $currentToken = null;
-            if ($state->isConnected() && $this->isSameSite($state)) {
-                $currentToken = $state->siteToken();
-            } elseif ($state->isConnected()) {
+            if ($this->copyPause($state) !== null) {
+                $failed = $this->probe($this->loadState());
+
+                return $failed !== null ? $failed : $this->connectTo(
+                    $this->enrolWith((string) $this->config->credentials()->enrolmentKey(), null),
+                    $this->config->origin(),
+                    $state,
+                    $now,
+                    $this->config->wording()->siteExists()
+                );
+            }
+
+            $currentToken = $this->heldToken($state);
+            if ($currentToken === null && $state->isConnected()) {
                 $state = $state->forgetConnection();
             }
             $failed = $this->save($state);
@@ -169,6 +194,121 @@ final class Reporter
             }
 
             return $this->send('activated', $enrolled, $now);
+        } catch (\Throwable $e) {
+            return $this->unexpected($e);
+        }
+    }
+
+    /**
+     * Why this site can't be connected from a screen, for the screen to say
+     * instead of offering to. It sends nothing and never throws.
+     *
+     * @return string|null Null when it can.
+     */
+    public function connectProblem(): ?string
+    {
+        try {
+            $refusal = $this->connectRefusal();
+
+            return $refusal !== null ? $refusal->message() : null;
+        } catch (\Throwable $e) {
+            return $this->unexpected($e)->message();
+        }
+    }
+
+    /**
+     * Start connecting this site with a button. Keep the request in the
+     * session of the person who clicked, send their browser to its url(), and
+     * give it to connectWithCode() when they come back.
+     *
+     * @param  string  $returnUrl  Where the browser comes back to: one AuthorizationRequest::canReturnTo() allows.
+     *
+     * @throws \Exception When PHP has no source of randomness.
+     */
+    public function authorizationRequest(string $returnUrl): AuthorizationRequest
+    {
+        return AuthorizationRequest::create(
+            $this->config->origin(),
+            $this->config->platform(),
+            (string) $this->config->siteUrl(),
+            $this->siteName(),
+            $returnUrl,
+            $this->now()
+        );
+    }
+
+    /**
+     * Connect with the one-time code the browser came back with. The code is
+     * traded where the request was made and for the site as it was approved,
+     * sent nowhere else and never kept. Unless that gives a connection,
+     * whatever is stored stays as it is.
+     *
+     * @param  mixed  $state  The state that came back with the code, which must be the request's.
+     * @param  mixed  $code
+     */
+    public function connectWithCode(AuthorizationRequest $request, $state, $code): Result
+    {
+        try {
+            $refusal = $this->connectRefusal();
+            if ($refusal !== null) {
+                return $refusal;
+            }
+
+            $now = $this->now();
+            if (! $request->matches($state) || $request->isExpired($now)) {
+                return self::refused('That connection request expired. Click Connect again.');
+            }
+            if (! is_string($code) || ! AuthorizationRequest::isCode($code)) {
+                return self::refused("All's Well could not connect this site. Click Connect again.");
+            }
+            if (! Url::sameSite($request->siteUrl(), (string) $this->config->siteUrl())) {
+                return self::refused("This site's address changed while it was being connected. Click Connect again.");
+            }
+
+            $stored = $this->loadState();
+            $failed = $this->probe($stored);
+            if ($failed !== null) {
+                return $failed;
+            }
+
+            $response = $this->client->exchange($request, $code, $this->heldToken($stored), $this->config->timeout(), $this->config->addonVersion());
+
+            return $this->connectTo($response, $request->origin(), $stored, $now, self::REPLACE);
+        } catch (\Throwable $e) {
+            return $this->unexpected($e);
+        }
+    }
+
+    /**
+     * Connect with what someone typed: the site's token, or the team's key,
+     * which is used once and never kept. A connection that works is replaced
+     * only once All's Well has taken the new one. With nothing connected, a
+     * token is also kept when All's Well couldn't be reached to check it.
+     */
+    public function connectWithCredential(string $credential): Result
+    {
+        try {
+            $refusal = $this->connectRefusal();
+            if ($refusal !== null) {
+                return $refusal;
+            }
+
+            $now = $this->now();
+            $credential = trim($credential);
+            $kind = Credentials::kind($credential);
+            if ($kind === null) {
+                return self::refused('That is neither a site token nor an enrolment key.');
+            }
+
+            $stored = $this->loadState();
+            $failed = $this->probe($stored);
+            if ($failed !== null) {
+                return $failed;
+            }
+
+            return $kind === 'token'
+                ? $this->connectToToken(strtolower($credential), $stored, $now)
+                : $this->connectTo($this->enrolWith($credential, $this->heldToken($stored)), $this->config->origin(), $stored, $now, $this->config->wording()->siteExists());
         } catch (\Throwable $e) {
             return $this->unexpected($e);
         }
@@ -212,7 +352,7 @@ final class Reporter
                 $state = $this->loadState();
             }
 
-            if ($this->config->isKeyMode()) {
+            if ($this->config->mode() !== 'token') {
                 $state = $state->forgetConnection();
             }
             $failed = $this->save($state->with(['paused' => State::PAUSED_DISCONNECTED]), $sent !== null ? $sent->status() : null);
@@ -220,7 +360,7 @@ final class Reporter
                 return $failed;
             }
 
-            $message = 'Disconnected. Remove ALLS_WELL_TOKEN or ALLS_WELL_KEY to stop for good.';
+            $message = $this->config->wording()->disconnected();
             if (! $this->config->isKeyMode()) {
                 $message .= " The site stays in All's Well until it's deleted there.";
             }
@@ -240,7 +380,13 @@ final class Reporter
      * and never throws. A site deleted in All's Well isn't connected, even
      * while its token is still set.
      *
-     * @return array{mode: 'token'|'key'|null, site_url: string|null, origin: string|null, connected: bool, paused: string|null, last_report_at: int|null, last_attempt_at: int|null, last_status: int|null, last_error: string|null, backoff_until: int, errors: list<string>, persistent: bool}
+     * A copy of a kept connection, at another address or in another
+     * environment, isn't connected either: `paused` then says which.
+     *
+     * A scheduled report goes out from `next_report_at` on. It is null while
+     * none would.
+     *
+     * @return array{mode: 'token'|'key'|'stored'|null, site_url: string|null, origin: string|null, dashboard_url: string|null, connected: bool, paused: string|null, last_report_at: int|null, last_attempt_at: int|null, last_status: int|null, last_error: string|null, backoff_until: int, next_report_at: int|null, errors: list<string>, persistent: bool}
      */
     public function status(): array
     {
@@ -250,30 +396,34 @@ final class Reporter
             if ($problem !== null) {
                 $errors[] = $problem;
             }
-            $credentials = $this->config->credentials();
-            $mode = $credentials->siteToken() !== null ? 'token' : ($this->config->isKeyMode() ? 'key' : null);
+            $mode = $this->config->mode();
+
+            $next = null;
 
             try {
                 $state = $this->loadState();
+                $next = $this->nextReportAt($state);
             } catch (\Throwable $e) {
                 $state = State::empty();
                 $errors[] = 'The saved state could not be read ('.ClassName::of($e).').';
             }
 
-            $connected = $mode !== null && $state->paused() !== State::PAUSED_DELETED && $this->isConnectedHere($state);
+            $connected = $state->paused() !== State::PAUSED_DELETED && $this->isConnectedHere($state);
             $origin = $state->origin();
 
             return [
                 'mode' => $mode,
                 'site_url' => $this->config->siteUrl(),
                 'origin' => $connected && $origin !== null ? $origin : $this->config->origin(),
+                'dashboard_url' => $connected ? $state->dashboardUrl() : null,
                 'connected' => $connected,
-                'paused' => $state->paused(),
+                'paused' => $state->paused() !== null ? $state->paused() : $this->copyPause($state),
                 'last_report_at' => $state->lastReportAt(),
                 'last_attempt_at' => $state->lastAttemptAt(),
                 'last_status' => $state->lastStatus(),
                 'last_error' => $state->lastError(),
                 'backoff_until' => $state->backoffUntil(),
+                'next_report_at' => $next,
                 'errors' => $errors,
                 'persistent' => $this->config->state()->isPersistent(),
             ];
@@ -285,6 +435,7 @@ final class Reporter
                 'mode' => null,
                 'site_url' => null,
                 'origin' => null,
+                'dashboard_url' => null,
                 'connected' => false,
                 'paused' => null,
                 'last_report_at' => null,
@@ -292,6 +443,7 @@ final class Reporter
                 'last_status' => null,
                 'last_error' => null,
                 'backoff_until' => 0,
+                'next_report_at' => null,
                 'errors' => ['Unexpected error ('.$class.').'],
                 'persistent' => false,
             ];
@@ -318,6 +470,18 @@ final class Reporter
     }
 
     /**
+     * Whether a light report is only a goodbye from a connection that is
+     * already held. A host that is being removed sends it from memory, its
+     * own store being gone, and the key needs nowhere to keep a token then.
+     *
+     * @return bool
+     */
+    private function isFarewell()
+    {
+        return $this->config->enabled() && $this->config->errors(false) === [] && $this->heldToken($this->loadState()) !== null;
+    }
+
+    /**
      * The key-mode connection to report with: the stored one when it was made
      * for this address, otherwise a new one from enrolling, or why there is none.
      *
@@ -327,14 +491,17 @@ final class Reporter
      */
     private function keyModeConnection(State $state, $light, $now)
     {
-        if ($state->isConnected() && $this->isSameSite($state)) {
+        if ($this->heldToken($state) !== null) {
             return $state;
         }
 
         if ($light) {
-            return $state->isConnected()
-                ? new Result(Result::PAUSED, "This copy of the site isn't connected, so nothing was sent.")
-                : new Result(Result::SKIPPED, "This site isn't connected to All's Well, so nothing was sent.");
+            return $state->isConnected() ? self::copyResult() : self::notConnectedResult();
+        }
+
+        $paused = $this->copyPause($state);
+        if ($paused !== null) {
+            return new Result(Result::PAUSED, $this->pauseMessage($state, $paused));
         }
 
         if ($state->isConnected()) {
@@ -348,6 +515,60 @@ final class Reporter
         }
 
         return $this->enrol($state, null, $now);
+    }
+
+    /**
+     * The connection kept in the state, or why it can't be used. A copy of it
+     * sends and saves nothing: it may be a database pulled from the live site,
+     * and one that moved on purpose is connected again by hand.
+     *
+     * @param  bool  $light
+     * @return State|Result
+     */
+    private function storedConnection(State $state, $light)
+    {
+        if (! self::isKept($state)) {
+            return self::notConnectedResult();
+        }
+
+        $paused = $this->copyPause($state);
+        if ($paused === null) {
+            return $state;
+        }
+
+        return $light ? self::copyResult() : new Result(Result::PAUSED, $this->pauseMessage($state, $paused));
+    }
+
+    /**
+     * Why there is no kept connection to resume, for the owner to act on.
+     *
+     * @return Result|null Null when there is one.
+     */
+    private function unmadeConnection(State $state)
+    {
+        if (! self::isKept($state)) {
+            return new Result(Result::FAILED, $this->config->wording()->notConnected(), null, true);
+        }
+
+        $paused = $this->copyPause($state);
+
+        return $paused === null ? null : new Result(Result::FAILED, $this->pauseMessage($state, $paused), null, true);
+    }
+
+    /**
+     * @return Result
+     */
+    private static function notConnectedResult()
+    {
+        return new Result(Result::SKIPPED, "This site isn't connected to All's Well, so nothing was sent.");
+    }
+
+    /**
+     * @return Result
+     */
+    private static function copyResult()
+    {
+        return new Result(Result::PAUSED, "This copy of the site isn't connected, so nothing was sent.");
     }
 
     /**
@@ -413,11 +634,8 @@ final class Reporter
     private function holdsConnection(State $stored)
     {
         $token = $this->config->credentials()->siteToken();
-        if ($token !== null) {
-            return self::sameToken($stored->siteToken(), $token);
-        }
 
-        return $stored->isConnected() && $this->isSameSite($stored);
+        return $token !== null ? self::sameToken($stored->siteToken(), $token) : $this->isConnectedHere($stored);
     }
 
     /**
@@ -439,6 +657,9 @@ final class Reporter
      * it is recorded only once All's Well accepts a report from it
      * (recordSuccess()), so a copy it refuses never looks like this site.
      *
+     * Where connections are kept, what a token left behind goes unseen once
+     * ALLS_WELL_TOKEN no longer sets it: its pause would be nobody's to lift.
+     *
      * @return State
      */
     private function loadState()
@@ -446,7 +667,7 @@ final class Reporter
         $state = $this->config->state()->load();
         $token = $this->config->credentials()->siteToken();
         if ($token === null) {
-            return $state;
+            return $this->isLeftBehind($state) ? State::empty() : $state;
         }
 
         if (! self::sameToken($state->siteToken(), $token)) {
@@ -464,18 +685,86 @@ final class Reporter
     }
 
     /**
-     * Whether there is a connection to report with from this address: always
-     * with a site token, and with a key only when it was made for this address.
+     * Whether the state is that of a token ALLS_WELL_TOKEN once set.
+     *
+     * @return bool
+     */
+    private function isLeftBehind(State $state)
+    {
+        return $this->config->mode() === 'stored' && $state->siteToken() !== null && ! $state->wasMadeHere();
+    }
+
+    /**
+     * Whether there is a connection to report with from here: always with a
+     * site token, otherwise only one made for this install.
      *
      * @return bool
      */
     private function isConnectedHere(State $state)
     {
-        if (! $this->config->isKeyMode()) {
-            return $this->config->credentials()->siteToken() !== null;
+        switch ($this->config->mode()) {
+            case 'token':
+                return true;
+            case 'key':
+                return $this->heldToken($state) !== null;
+            case 'stored':
+                return self::isKept($state) && $this->difference($state) === null;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Whether the state holds a connection that was made here. One copied
+     * from ALLS_WELL_TOKEN isn't: taking that setting away stops the site.
+     *
+     * @return bool
+     */
+    private static function isKept(State $state)
+    {
+        return $state->isConnected() && $state->wasMadeHere();
+    }
+
+    /**
+     * @return string|null The stored token, when the connection was made for this install.
+     */
+    private function heldToken(State $state)
+    {
+        return $state->isConnected() && $this->difference($state) === null ? $state->siteToken() : null;
+    }
+
+    /**
+     * How this install differs from the one the stored connection was made
+     * for: another address, or another environment. One without a name is
+     * another than one with: pausing the live site once by mistake is alerted
+     * and put right, but a copy that reports as the live site is neither.
+     *
+     * @return string|null State::PAUSED_MOVED, State::PAUSED_ENVIRONMENT, or null when it is the same.
+     */
+    private function difference(State $state)
+    {
+        if (! $this->isSameSite($state)) {
+            return State::PAUSED_MOVED;
         }
 
-        return $state->isConnected() && $this->isSameSite($state);
+        return $state->enrolledEnvironment() !== $this->config->boundEnvironment() ? State::PAUSED_ENVIRONMENT : null;
+    }
+
+    /**
+     * The pause a copied connection is under, which is never saved. With a
+     * key, a copy at another address enrols as a site of its own instead.
+     *
+     * @return string|null
+     */
+    private function copyPause(State $state)
+    {
+        if ($this->config->mode() === 'stored') {
+            return self::isKept($state) ? $this->difference($state) : null;
+        }
+
+        return $this->config->isKeyMode() && $state->isConnected() && $this->difference($state) === State::PAUSED_ENVIRONMENT
+            ? State::PAUSED_ENVIRONMENT
+            : null;
     }
 
     /**
@@ -488,9 +777,41 @@ final class Reporter
      */
     private static function notDue(State $state, $now)
     {
+        $due = self::dueAt($state);
+
+        return $due !== null && $due > $now;
+    }
+
+    /**
+     * @return int|null When the interval All's Well asked for has passed, nearly; null before the first report.
+     */
+    private static function dueAt(State $state)
+    {
         $last = $state->lastReportAt();
 
-        return $last !== null && $last + $state->intervalSeconds() - self::DUE_EARLY > $now;
+        return $last === null ? null : $last + $state->intervalSeconds() - self::DUE_EARLY;
+    }
+
+    /**
+     * When report() would next send a scheduled report, or enrol first: now
+     * for one that was never sent, and the past for one that is overdue.
+     *
+     * @return int|null Null while it would send none.
+     */
+    private function nextReportAt(State $state)
+    {
+        if ($this->refusal() !== null || $state->paused() !== null || $this->copyPause($state) !== null || $this->unusableState() !== null) {
+            return null;
+        }
+
+        $isConnected = $this->isConnectedHere($state);
+        if (! $isConnected && ! $this->config->isKeyMode()) {
+            return null;
+        }
+
+        $due = $isConnected ? self::dueAt($state) : null;
+
+        return max($due !== null ? $due : $this->now(), $state->backoffUntil());
     }
 
     /**
@@ -505,21 +826,44 @@ final class Reporter
      */
     private function send($reason, State $state, $now)
     {
-        $token = $state->siteToken();
-        $reportUrl = $state->reportUrl();
-        if ($token === null || $reportUrl === null) {
-            return new Result(Result::SKIPPED, "This site isn't connected to All's Well, so nothing was sent.");
+        if (! $state->isConnected()) {
+            return self::notConnectedResult();
         }
 
-        $report = (new ReportBuilder($this->config, $this->packages()))->build($reason, $now);
-        $response = $this->client->report($reportUrl, $token, $report, $this->config->timeout());
-
-        return $this->record($response, $state, $now);
+        return $this->record($this->deliver($reason, $state, $now), $state, $now);
     }
 
     /**
-     * Record the answer from All's Well to a report. Every answer stamps the
-     * attempt and its status.
+     * Build the report and post it with the connection in $state.
+     *
+     * @param  string  $reason
+     * @param  int  $now
+     * @return Response
+     */
+    private function deliver($reason, State $state, $now)
+    {
+        $report = (new ReportBuilder($this->config, $this->packages()))->build($reason, $now);
+
+        return $this->client->report((string) $state->reportUrl(), (string) $state->siteToken(), $report, $this->config->timeout());
+    }
+
+    /**
+     * Record the answer from All's Well to a report.
+     *
+     * @param  int  $now
+     * @return Result
+     */
+    private function record(Response $response, State $state, $now)
+    {
+        [$next, $result] = $this->outcome($response, $state, $now);
+        $failed = $this->save($next, $response->status(), $response->status() === 200);
+
+        return $failed !== null ? $failed : $result;
+    }
+
+    /**
+     * What an answer to a report comes to: the state to save and the result.
+     * Every answer stamps the attempt and its status.
      *
      * Only the owner can fix a 409 site_moved, a 410 or a 422, so those need
      * attention. Everything else is retried by itself, and needs attention
@@ -527,16 +871,15 @@ final class Reporter
      * has never reported.
      *
      * @param  int  $now
-     * @return Result
+     * @return array{0: State, 1: Result}
      */
-    private function record(Response $response, State $state, $now)
+    private function outcome(Response $response, State $state, $now)
     {
         $status = $response->status();
-        $neverReported = $this->neverReported($state);
         $changes = ['last_attempt_at' => $now, 'last_status' => $status];
 
         if ($status === 200) {
-            return $this->recordSuccess($response, $state, $changes, $now);
+            return [$this->afterSuccess($response, $state, $changes, $now), new Result(Result::SENT, 'Report sent.', 200)];
         }
 
         if ($status === 409 && $response->errorCode() === 'site_moved') {
@@ -545,30 +888,27 @@ final class Reporter
                 'paused' => State::PAUSED_SITE_MOVED,
                 'last_error' => $message === '' ? self::SITE_MOVED_FALLBACK : $message,
             ]);
-            $failed = $this->save($state, $status);
 
-            return $failed !== null ? $failed : new Result(Result::PAUSED, $this->pauseMessage($state), $status, true);
+            return [$state, new Result(Result::PAUSED, $this->pauseMessage($state), $status, true)];
         }
 
         if ($status === 410) {
-            if ($this->config->isKeyMode()) {
+            if ($this->config->mode() !== 'token') {
                 $state = $state->forgetConnection();
             }
             $state = $state->with($changes + [
                 'paused' => State::PAUSED_DELETED,
                 'last_error' => "This site was deleted in All's Well.",
             ]);
-            $failed = $this->save($state, $status);
 
-            return $failed !== null ? $failed : new Result(Result::PAUSED, $this->pauseMessage($state), $status, true);
+            return [$state, new Result(Result::PAUSED, $this->pauseMessage($state), $status, true)];
         }
 
         if ($status === 401) {
             $changes['backoff_until'] = $now + self::UNKNOWN_TOKEN_BACKOFF;
             $changes['last_error'] = "All's Well does not recognise this site's token.";
         } elseif ($status === 422) {
-            $message = self::oneLine((string) $response->message());
-            $changes['last_error'] = $message === '' ? "All's Well rejected the report." : "All's Well rejected the report: ".$message;
+            $changes['last_error'] = self::reportRejected(self::oneLine((string) $response->message()));
         } elseif ($status === 429) {
             $changes['backoff_until'] = $now + min(self::MAX_BACKOFF, max(self::MIN_RETRY_AFTER, (int) $response->retryAfter()));
             $changes['last_error'] = "All's Well is busy, so the report will be tried again later.";
@@ -579,28 +919,29 @@ final class Reporter
             $changes['last_error'] = $status === 0 ? self::unreachable($response) : "All's Well answered with HTTP ".$status.'.';
         }
 
-        $failed = $this->save($state->with($changes), $status);
-
-        return $failed !== null ? $failed : new Result(Result::FAILED, $changes['last_error'], $status, $status === 422 || $neverReported);
+        return [
+            $state->with($changes),
+            new Result(Result::FAILED, $changes['last_error'], $status, $status === 422 || $this->neverReported($state)),
+        ];
     }
 
     /**
-     * Record a report All's Well accepted: clear the failures, back-off and
-     * pause, take the interval it asks for and follow it if it moved. A state
-     * that can't be saved now needs attention whatever came before: All's
-     * Well sees the reports, so it will never alert, and the owner has to fix
-     * where the state is kept.
+     * The state after a report All's Well accepted: clear the failures,
+     * back-off and pause, take the interval it asks for and follow it if it
+     * moved. When it can't be saved the owner is told whatever came before:
+     * All's Well sees the reports, so it will never alert, and the owner has
+     * to fix where the state is kept.
      *
      * In token mode, accepting the report is what binds the token to this
-     * address: the connection is saved with the site key, so switching the
-     * same app to a key later goes on reporting as this site, while a copy
-     * All's Well refused (409 site_moved) keeps the address it had.
+     * address and environment: the connection is saved with the site key, so
+     * switching the same app to a key later goes on reporting as this site,
+     * while a copy All's Well refused (409 site_moved) keeps what it had.
      *
      * @param  array<string, int|string|null>  $changes
      * @param  int  $now
-     * @return Result
+     * @return State
      */
-    private function recordSuccess(Response $response, State $state, array $changes, $now)
+    private function afterSuccess(Response $response, State $state, array $changes, $now)
     {
         $body = $response->body();
         $changes += [
@@ -613,13 +954,16 @@ final class Reporter
         if (isset($body['interval_seconds'])) {
             $changes['interval_seconds'] = self::interval($body['interval_seconds']);
         }
-        if (! $this->config->isKeyMode()) {
+        if ($this->config->mode() === 'token') {
             $changes['enrolled_site_key'] = Url::siteKey((string) $this->config->siteUrl());
+            $changes['enrolled_environment'] = $this->config->boundEnvironment();
+        }
+        $dashboardUrl = self::text($body, 'dashboard_url');
+        if ($dashboardUrl !== null && Url::sameOrigin($state->origin(), $dashboardUrl) && ! Url::sameOrigin($state->origin(), (string) $state->dashboardUrl())) {
+            $changes['dashboard_url'] = $dashboardUrl;
         }
 
-        $failed = $this->save($state->with($this->followAppMove($state, $body) + $changes), 200, true);
-
-        return $failed !== null ? $failed : new Result(Result::SENT, 'Report sent.', 200);
+        return $state->with($this->followAppMove($state, $body) + $changes);
     }
 
     /**
@@ -662,8 +1006,8 @@ final class Reporter
     }
 
     /**
-     * Enrol with the team key and store the site token All's Well returns,
-     * or record why not and back off.
+     * Enrol with the set key and store the site token All's Well returns, or
+     * record why not and back off.
      *
      * @param  string|null  $currentToken  The token already held for this address, so enrolling again returns it.
      * @param  int  $now
@@ -671,16 +1015,161 @@ final class Reporter
      */
     private function enrol(State $state, $currentToken, $now)
     {
-        $origin = $this->config->origin();
-        $response = $this->client->enrol(
-            $origin,
-            (string) $this->config->credentials()->enrolmentKey(),
+        $response = $this->enrolWith((string) $this->config->credentials()->enrolmentKey(), $currentToken);
+        $connection = $this->connectionIn($response, $this->config->origin(), $now);
+        if ($connection instanceof Result) {
+            return $connection;
+        }
+        if ($connection === null) {
+            return $this->enrolmentFailed($state, $response, $now, $currentToken === null);
+        }
+
+        $state = $state->with($connection);
+        $failed = $this->save($state, $response->status());
+
+        return $failed !== null ? $failed : $state;
+    }
+
+    /**
+     * @param  string  $key
+     * @param  string|null  $currentToken
+     * @return Response
+     */
+    private function enrolWith($key, $currentToken)
+    {
+        return $this->client->enrol(
+            $this->config->origin(),
+            $key,
             $this->config->platform(),
             ['url' => (string) $this->config->siteUrl(), 'name' => $this->siteName()],
             $currentToken,
-            $this->config->timeout()
+            $this->config->timeout(),
+            $this->config->addonVersion()
         );
+    }
 
+    /**
+     * Keep the connection an answer gives and send its first report, or say
+     * why there is none, leaving what is stored alone.
+     *
+     * @param  string  $origin
+     * @param  int  $now
+     * @param  string  $siteExists  What to do when the site is already connected and reporting.
+     * @return Result
+     */
+    private function connectTo(Response $response, $origin, State $state, $now, $siteExists)
+    {
+        $connection = $this->connectionIn($response, $origin, $now);
+        if ($connection instanceof Result) {
+            return $connection;
+        }
+        if ($connection === null) {
+            return self::refused(self::enrolmentError($response, $siteExists), $response->status());
+        }
+
+        $state = self::forToken($state, $connection['site_token'])->with($connection);
+        $failed = $this->save($state, $response->status());
+        if ($failed !== null) {
+            return $failed;
+        }
+
+        try {
+            $first = $this->deliver('activated', $state, $now);
+        } catch (\Throwable $e) {
+            return new Result(Result::CONNECTED, self::FIRST_REPORT.$this->unexpected($e)->message());
+        }
+
+        return $this->recordFirst($first, $state, $now, self::FIRST_REPORT);
+    }
+
+    /**
+     * Report with a token someone typed and keep it if All's Well takes the
+     * report. Any other answer leaves what is stored alone, except that a site
+     * with nothing connected keeps the token to try again when All's Well was
+     * busy or out of reach.
+     *
+     * @param  string  $token
+     * @param  int  $now
+     * @return Result
+     */
+    private function connectToToken($token, State $stored, $now)
+    {
+        $origin = $this->config->origin();
+        $state = self::forToken($stored, $token)->with([
+            'site_token' => $token,
+            'origin' => $origin,
+            'report_url' => $origin.'/site/report',
+        ] + $this->madeHere());
+
+        $response = $this->deliver('activated', $state, $now);
+        $status = $response->status();
+        $body = $response->body();
+
+        if ($status === 200 && isset($body['protocol']) && $body['protocol'] === 1) {
+            return $this->record($response, $state, $now);
+        }
+        if (in_array($status, [401, 409, 410, 422], true)) {
+            return self::refused(self::tokenRefusal($response), $status);
+        }
+
+        $replaces = $this->isConnectedHere($stored) && ! self::sameToken($stored->siteToken(), $token);
+        if (! $replaces && ($status === 0 || $status === 429 || $status >= 500)) {
+            return $this->recordFirst($response, $state, $now, 'The token is saved, and will be tried again: ');
+        }
+
+        if ($status === 0) {
+            $why = self::unreachable($response);
+        } else {
+            $why = $status === 200 ? "All's Well sent an unexpected answer." : "All's Well answered with HTTP ".$status.'.';
+        }
+
+        return self::refused('That token could not be checked, so nothing changed. '.$why, $status);
+    }
+
+    /**
+     * Record the answer to the first report of a connection someone just
+     * made. Where it will be tried again by itself, the site is connected.
+     *
+     * @param  int  $now
+     * @param  string  $saying  What to say first, then.
+     * @return Result
+     */
+    private function recordFirst(Response $response, State $state, $now, $saying)
+    {
+        $status = $response->status();
+        [$next, $result] = $this->outcome($response, $state, $now);
+        $failed = $this->save($next, $status, $status === 200);
+        if ($failed !== null) {
+            return $failed;
+        }
+
+        return $result->outcome() === Result::FAILED && $status !== 401 && $status !== 422
+            ? new Result(Result::CONNECTED, $saying.$result->message(), $status)
+            : $result;
+    }
+
+    /**
+     * Save the state as it is stored, to find out before anything is sent
+     * whether a connection could be kept: one that All's Well gave and that
+     * was then lost would take the site's reporting with it. State that can't
+     * be read is left for the connection itself to replace.
+     *
+     * @return Result|null Null when it can.
+     */
+    private function probe(State $stored)
+    {
+        return $this->config->state()->isUnreadable() ? null : $this->save($stored);
+    }
+
+    /**
+     * The connection in an enrolment's answer, as changes to the state.
+     *
+     * @param  string  $origin
+     * @param  int  $now
+     * @return array<string, mixed>|Result|null Null when the answer holds none; a Result when it names another host.
+     */
+    private function connectionIn(Response $response, $origin, $now)
+    {
         $body = $response->body();
         $token = self::text($body, 'site_token');
         $reportUrl = self::text($body, 'report_url');
@@ -695,30 +1184,126 @@ final class Reporter
         }
 
         if (! $response->isSuccess() || $reportUrl === null || $token === null || Credentials::kind($token) !== 'token') {
-            return $this->enrolmentFailed($state, $response, $now, $currentToken === null);
+            return null;
         }
 
         $dashboardUrl = self::text($body, 'dashboard_url');
         $siteId = isset($body['site_id']) && (is_string($body['site_id']) || is_int($body['site_id'])) ? (string) $body['site_id'] : null;
 
-        $state = $state->with([
+        return [
             'site_token' => $token,
             'site_id' => $siteId,
             'origin' => $origin,
             'report_url' => $reportUrl,
             'dashboard_url' => $dashboardUrl !== null && Url::sameOrigin($origin, $dashboardUrl) ? $dashboardUrl : null,
-            'enrolled_site_key' => Url::siteKey((string) $this->config->siteUrl()),
             'interval_seconds' => self::interval(isset($body['interval_seconds']) ? $body['interval_seconds'] : null),
+            'last_attempt_at' => $now,
+            'last_status' => $response->status(),
+        ] + $this->madeHere();
+    }
+
+    /**
+     * What every connection made here starts with: whose it is, and no
+     * failure, back-off or pause.
+     *
+     * @return array<string, mixed>
+     */
+    private function madeHere()
+    {
+        return [
+            'enrolled_site_key' => Url::siteKey((string) $this->config->siteUrl()),
+            'enrolled_environment' => $this->config->boundEnvironment(),
+            'made_here' => true,
             'failures' => 0,
             'backoff_until' => 0,
             'paused' => null,
-            'last_attempt_at' => $now,
-            'last_status' => $response->status(),
             'last_error' => null,
-        ]);
-        $failed = $this->save($state, $response->status());
+        ];
+    }
 
-        return $failed !== null ? $failed : $state;
+    /**
+     * The state to keep a token's connection in: without what belonged to
+     * another token, such as when that one last reported.
+     *
+     * @param  string  $token
+     * @return State
+     */
+    private static function forToken(State $state, $token)
+    {
+        return self::sameToken($state->siteToken(), $token) ? $state : $state->forgetConnection();
+    }
+
+    /**
+     * Why connecting by hand must stop before contacting All's Well: the
+     * connection could not be made or kept, or would not be used. Stored
+     * state that can't be read is no obstacle, since the connection replaces it.
+     *
+     * @return Result|null
+     */
+    private function connectRefusal()
+    {
+        $refusal = $this->refusal();
+        if ($refusal !== null) {
+            return self::refused($refusal->message());
+        }
+
+        if (Url::hasCredentials((string) $this->config->siteUrl())) {
+            return self::refused("This site's address has a username or password in it. Set ".$this->config->wording()->addressSetting().' to the address without them.');
+        }
+        if (! $this->config->keepsConnection()) {
+            return self::refused("A connection can't be kept here. Set ALLS_WELL_TOKEN or ALLS_WELL_KEY instead.");
+        }
+        if ($this->config->mode() === 'token') {
+            return self::refused('ALLS_WELL_TOKEN sets the site this one reports as. Remove it to connect another way.');
+        }
+
+        $store = $this->config->state();
+        if (! $store->isPersistent()) {
+            return self::refused($this->config->wording()->keyNeedsState());
+        }
+        $problem = $store->problem();
+
+        return $problem !== null && ! $store->isUnreadable() ? self::refused($problem) : null;
+    }
+
+    /**
+     * @param  string  $message
+     * @param  int|null  $status
+     * @return Result
+     */
+    private static function refused($message, $status = null)
+    {
+        return new Result(Result::FAILED, $message, $status, true);
+    }
+
+    /**
+     * Why All's Well refused a report made with a token someone typed.
+     *
+     * @return string
+     */
+    private static function tokenRefusal(Response $response)
+    {
+        $message = self::oneLine((string) $response->message());
+
+        switch ($response->status()) {
+            case 401:
+                return "All's Well does not recognise that site token.";
+            case 410:
+                return "That site was deleted in All's Well.";
+            case 409:
+                return $message === '' ? self::SITE_MOVED_FALLBACK : $message;
+            default:
+                return self::reportRejected($message);
+        }
+    }
+
+    /**
+     * @param  string  $message  What All's Well said of it, if anything.
+     * @return string
+     */
+    private static function reportRejected($message)
+    {
+        return $message === '' ? "All's Well rejected the report." : "All's Well rejected the report: ".$message;
     }
 
     /**
@@ -734,7 +1319,7 @@ final class Reporter
     private function enrolmentFailed(State $state, Response $response, $now, $backOff)
     {
         $status = $response->status();
-        $message = self::enrolmentError($response);
+        $message = self::enrolmentError($response, $this->config->wording()->siteExists());
         $changes = [
             'last_attempt_at' => $now,
             'last_status' => $status,
@@ -756,12 +1341,13 @@ final class Reporter
 
     /**
      * Why an enrolment failed, in words the site's owner can act on: the
-     * server's message when it sends one, except for a 409, where the
-     * package knows the fix (ALLS_WELL_TOKEN) better than the server.
+     * server's message when it sends one, except for a 409, where the host
+     * knows the fix better than the server.
      *
+     * @param  string  $siteExists
      * @return string
      */
-    private static function enrolmentError(Response $response)
+    private static function enrolmentError(Response $response, $siteExists)
     {
         $status = $response->status();
 
@@ -769,7 +1355,7 @@ final class Reporter
             return self::unreachable($response);
         }
         if ($status === 409) {
-            return "This site is already connected and reporting. Set ALLS_WELL_TOKEN to its site token, or delete it in All's Well.";
+            return $siteExists;
         }
         if ($response->isSuccess()) {
             return "All's Well sent an unexpected answer, so the site was not connected.";
@@ -813,27 +1399,32 @@ final class Reporter
     }
 
     /**
-     * What the owner can do about a pause. A deleted site comes back with a
-     * key by enrolling again; a site token belongs to the deleted site for
-     * good, so `connect` would only be refused again.
+     * What the owner can do about a pause. A deleted site comes back by
+     * connecting again; a site token belongs to the deleted site for good, so
+     * `connect` would only be refused again.
      *
+     * @param  string|null  $paused  The pause, when it isn't the saved one.
      * @return string
      */
-    private function pauseMessage(State $state)
+    private function pauseMessage(State $state, $paused = null)
     {
         $wording = $this->config->wording();
 
-        switch ($state->paused()) {
+        switch ($paused !== null ? $paused : $state->paused()) {
             case State::PAUSED_DELETED:
-                $message = $this->config->isKeyMode()
-                    ? "This site was deleted in All's Well. Run ".$wording->connect().' to connect it again.'
-                    : $wording->deletedWithToken();
+                $message = $this->config->mode() === 'token'
+                    ? $wording->deletedWithToken()
+                    : "This site was deleted in All's Well. ".$wording->reconnect();
                 break;
             case State::PAUSED_DISCONNECTED:
-                $message = 'Reporting was turned off with '.$wording->disconnect().'. Run '.$wording->connect().' to turn it back on.';
+                $message = 'Reporting was turned off with '.$wording->disconnect().'. '
+                    .($this->config->mode() === 'stored' ? $wording->reconnect() : 'Run '.$wording->connect().' to turn it back on.');
                 break;
             case State::PAUSED_MOVED:
-                $message = "This site's address changed since it was connected. Run ".$wording->connect().' to connect it again.';
+                $message = "This site's address changed since it was connected. ".$wording->reconnect();
+                break;
+            case State::PAUSED_ENVIRONMENT:
+                $message = $this->environmentMessage($state).' '.$wording->reconnect();
                 break;
             default:
                 $error = self::oneLine((string) $state->lastError());
@@ -841,6 +1432,21 @@ final class Reporter
         }
 
         return $message;
+    }
+
+    /**
+     * @return string How the environment here differs from the one the site was connected in.
+     */
+    private function environmentMessage(State $state)
+    {
+        $made = $state->enrolledEnvironment();
+        $here = $this->config->boundEnvironment();
+
+        return 'This site was connected in '
+            .($made === null ? 'an environment with no name' : 'its "'.self::oneLine($made).'" environment')
+            .' and '
+            .($here === null ? 'this one has no name' : 'this is "'.self::oneLine($here).'"')
+            .', so it may be a copy.';
     }
 
     /**

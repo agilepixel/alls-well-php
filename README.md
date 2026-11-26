@@ -189,7 +189,39 @@ if ($result->needsAttention()) {
 
 It takes the config file's keys, plus `state`: a `StateStore`, such as `FileStateStore`, where the reporter remembers its connection between calls. Without `state` nothing is remembered: `report()` sends every time, the key can't enrol, and `disconnect()` refuses.
 
-`report()` sends a report once one is due. The reporter also has `connect()`, `disconnect()` and `status()`. Each returns a `Result` with `isSuccess()`, `needsAttention()` and `message()`, except `status()`, which returns an array. None of them throws.
+`report()` sends a report once one is due. The reporter also has `connect()`, `disconnect()` and `status()`. Each returns a `Result` with `isSuccess()`, `needsAttention()` and `message()`, except `status()`, which returns an array. None of them throws. A scheduled `report()` sends from `status()['next_report_at']` on, and sends nothing while that is null.
+
+### Building on the package
+
+A CMS plugin, or any host with screens of its own, can pass these settings as well:
+
+| Setting | What it is |
+|---|---|
+| `platform` | `php`, `laravel` or `craft`. Other values are `php`. |
+| `addon_version` | The host's own version, reported instead of the package's. |
+| `platform_version` | The platform's version, reported instead of the one Composer gives. |
+| `php_version` | The PHP version to report, for a host whose command line runs another than its web server. |
+| `multisite` | `true` or `false`, where the platform has such a thing. |
+| `components` | A function returning components in the report's shape (`type`, `slug`, `name`, `version`, `latest_version`, `active`, `auto_update` and `package`, an `ecosystem` and a `name`). They replace Composer's entry for the same package. |
+| `host_checks` | The host's own checks. Unlike the owner's `checks`, their keys may start with `addon.`, and the owner's can't replace them. |
+| `stored_connection` | `true` to report with a connection the state store keeps, when neither `ALLS_WELL_TOKEN` nor `ALLS_WELL_KEY` is set. |
+| `bind_environment` | The environment's name, or null when none is set on purpose (not one guessed from the host name). A stored connection made in an environment with another name, or where only one of the two has a name, is treated as a copy. |
+| `wording` | `Wording::custom()`, with the host's own command names and advice. |
+
+With `stored_connection`, a person connects the site from the host's own screen. `connectProblem()` says why they can't, if so, and sends nothing.
+
+- **With a button.** Where `AuthorizationRequest::canReturnTo()` allows the screen's address, keep `$reporter->authorizationRequest($returnUrl)` in the person's session (`toArray()`), and send their browser to its `url()`. When the browser comes back, restore the request with `AuthorizationRequest::fromArray()` and drop it from the session. An `error` of `access_denied` means they cancelled. Otherwise call `connectWithCode($request, $state, $code)` with what the address carries.
+- **With what they type.** `connectWithCredential($credential)` takes a site token, or a team key, which is used once and never kept.
+
+Both return a `Result`: `isSuccess()` means the site is connected, and an outcome of `Result::CONNECTED` that its first report will be tried again. A connection that works is replaced only once All's Well has taken another.
+
+A copy of the stored connection, at another address or in another environment, sends and saves nothing of its own accord: `status()` says `paused: moved` or `paused: environment`, and `connected` is `false`. With `ALLS_WELL_KEY` set, a copy at another address enrols as a site of its own instead.
+
+The host keeps the state, so:
+
+- **Encrypt it.** It holds the site token. When the token can't be decrypted, the store's `isUnreadable()` is `true` and `problem()` asks for the site to be connected again, which replaces it. With `ALLS_WELL_TOKEN` set, return the state as empty instead: the token comes from there.
+- **Let one process at a time use the reporter,** by taking a lock around it.
+- **`ALLS_WELL_TOKEN` and `ALLS_WELL_KEY` come first.** A report made with `ALLS_WELL_TOKEN` replaces a stored connection.
 
 ## What it sends, and what it never sends
 
